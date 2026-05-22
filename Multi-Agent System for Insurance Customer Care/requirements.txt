@@ -1,0 +1,9 @@
+databricks-sdk>=0.89.0
+databricks-vectorsearch
+databricks-agents
+mlflow
+langgraph==0.3.5
+langgraph-checkpoint-postgres
+psycopg[binary]
+psycopg2-binary
+openai==1.82.0

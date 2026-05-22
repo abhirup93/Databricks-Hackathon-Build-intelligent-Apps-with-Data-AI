@@ -1,0 +1,4 @@
+command: ["sh", "-c", "streamlit run app.py --server.port $DATABRICKS_APP_PORT --server.headless true"]
+env:
+  - name: AGENT_ENDPOINT_NAME
+    value: "agents_main-insurance_support-insurance_support_agent"
