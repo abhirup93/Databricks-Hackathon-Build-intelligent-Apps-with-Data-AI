@@ -88,7 +88,6 @@ Organised into **9 sections** (run top-to-bottom):
 | 6. Testing | 25–32 | 5 scenario tests covering all agent paths + multi-turn memory demo |
 | 7. Vision Pipeline | V1–V8 | Car damage OCR, driving license OCR, claim form OCR, consistency checks, VS coverage lookup |
 | 8. Deployment | D1–D10 | Write `InsuranceAgentModel`, MLflow log/register, `agents.deploy()`, poll READY, smoke tests |
-| 9. Debug Utilities | DBG1–DBG10 | SQL connector test, Spark data verification, teardown, payload table cleanup |
 
 ### Streamlit App — `insurance-support-chatbot/`
 
