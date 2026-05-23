@@ -2,3 +2,7 @@ command: ["sh", "-c", "streamlit run app.py --server.port $DATABRICKS_APP_PORT -
 env:
   - name: AGENT_ENDPOINT_NAME
     value: "agents_main-insurance_support-insurance_support_agent"
+  - name: LAKEBASE_ENDPOINT
+    value: "projects/insurance-support-pg/branches/production/endpoints/primary"
+  - name: LAKEBASE_HOST
+    value: "ep-calm-cell-d1wr2dke.database.us-west-2.cloud.databricks.com"
