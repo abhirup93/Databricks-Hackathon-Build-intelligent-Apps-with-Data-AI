@@ -1103,65 +1103,219 @@ A dollar amount in Turn 2 is proof the billing agent queried the database and re
 
 ## The Streamlit App — Full Walkthrough
 
+The app went through a significant upgrade after the initial deployment. The original version stored conversation history only in Streamlit session state, which meant everything was lost on page refresh or re-login. The updated version persists every conversation to Lakebase PostgreSQL and restores it on the next login — scoped to the logged-in user so no one sees anyone else's history.
+
 ### app.py structure
 
 ```
 app.py
-  ├── WorkspaceClient() — OAuth handled by Databricks Apps runtime
-  ├── ENDPOINT_NAME — from os.environ["AGENT_ENDPOINT_NAME"] (injected by app.yaml)
-  ├── _init_session() — bootstrap session state keys
-  ├── save/load/delete conversation helpers
-  ├── call_agent(messages) — SDK query to serving endpoint
-  ├── check_endpoint_health() — verify READY state
-  ├── Sidebar — session list, example questions, routing info
-  └── Main chat area — message rendering, input, response loop
+  ├── WorkspaceClient()       — app SP OAuth, handled by Databricks Apps runtime
+  ├── APP_SP_NAME             — app SP UUID (PostgreSQL role for DB auth)
+  ├── _get_current_user()     — actual logged-in user email from request headers
+  ├── CURRENT_USER            — email used for per-user data isolation
+  ├── ENDPOINT_NAME           — from os.environ["AGENT_ENDPOINT_NAME"] (app.yaml)
+  ├── LAKEBASE_ENDPOINT       — Lakebase resource path (app.yaml)
+  ├── LAKEBASE_HOST           — Lakebase host (app.yaml)
+  ├── _get_lakebase_token()   — OAuth token for app SP, cached 50 min
+  ├── _get_conn()             — psycopg2 connection as app SP
+  ├── _ensure_table()         — creates conversation_metadata on first run
+  ├── db_load/save/delete     — Lakebase persistence helpers
+  ├── _init_session()         — bootstrap session state keys
+  ├── save/load/delete conversation helpers (session + DB)
+  ├── call_agent(messages)    — SDK query to serving endpoint
+  ├── check_endpoint_health() — verify READY state via SDK
+  ├── Sidebar                 — user identity, session list, example questions
+  └── Main chat area          — message rendering, input, response loop
 ```
 
-### Session Initialisation
+### The Identity Problem in Databricks Apps
+
+This is a subtle but important distinction. In Databricks Apps, `WorkspaceClient()` runs as the **app's service principal** — not as the individual logged-in user. This matters for two separate concerns.
+
+**DB connection auth:** `_w.postgres.generate_database_credential()` generates an OAuth token for whoever `_w` represents — the app SP. The PostgreSQL `user` in the connection must match that identity exactly. If you pass the logged-in user's email as the PostgreSQL user but authenticate with the app SP's token, PostgreSQL rejects it.
+
+**Per-user data isolation:** The actual logged-in user's email comes from request headers injected by Databricks' OAuth proxy — not from the SDK. You read it from `st.context.headers`.
 
 ```python
-def _init_session():
-    defaults = {
-        "conversations":     {},           # {session_id: {title, messages, turn_count}}
-        "active_session_id": str(uuid.uuid4()),
-        "messages":          [],
-        "turn_count":        0,
-        "pending_query":     None,         # deferred example question
-        "endpoint_ok":       None,         # None = unchecked
-        "load_session_id":   None,         # deferred session load
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+_w          = WorkspaceClient()
+APP_SP_NAME = _w.current_user.me().user_name  # app SP UUID — PostgreSQL role for DB auth
 
-_init_session()
+def _get_current_user() -> str:
+    """Real logged-in user email — from Databricks Apps request headers."""
+    try:
+        headers = st.context.headers
+        email = (
+            headers.get("X-Forwarded-Email")
+            or headers.get("X-Databricks-User-Email")
+            or headers.get("X-Forwarded-User")
+            or ""
+        )
+        if email:
+            return email
+    except Exception:
+        pass
+    return APP_SP_NAME  # fallback to app SP if headers unavailable
+
+CURRENT_USER = _get_current_user()  # used only for data isolation, not DB auth
 ```
 
-The `if k not in st.session_state` guard prevents overwriting existing state on every Streamlit re-run.
+`APP_SP_NAME` authenticates to PostgreSQL. `CURRENT_USER` appears in the `user_email` column of `conversation_metadata` and is used for all `WHERE user_email = %s` filters. Different users see only their own history.
+
+### Lakebase Connection
+
+The OAuth token for the app SP is cached for 50 minutes via `@st.cache_data`. The Lakebase token expires at 60 minutes — the cache TTL ensures a refresh before expiry without hitting the API on every page render.
+
+```python
+@st.cache_data(ttl=3000, show_spinner=False)
+def _get_lakebase_token(_key: str = "app_sp") -> str:
+    cred = _w.postgres.generate_database_credential(endpoint=LAKEBASE_ENDPOINT)
+    return cred.token
+
+def _get_conn() -> psycopg2.extensions.connection:
+    return psycopg2.connect(
+        host     = LAKEBASE_HOST,
+        port     = 5432,
+        dbname   = "databricks_postgres",
+        user     = APP_SP_NAME,    # app SP UUID — must match the token
+        password = _get_lakebase_token(),
+        sslmode  = "require",
+    )
+```
+
+### Lakebase Setup — Grants Required
+
+Before the app can connect and create tables, three things need to be in place in Lakebase.
+
+**Step 1 — Add the app SP as an OAuth role** via the Lakebase UI:
+
+```
+production branch → Roles & Databases → Add role → OAuth tab
+→ select the app SP from the dropdown → Add
+```
+
+**Step 2 — Give it CAN USE on the project** via Lakebase Settings → Permissions.
+
+**Step 3 — Run the following grants directly in the Lakebase SQL Editor** (navigate to production branch → SQL Editor, select the `databricks_postgres` database):
+
+```sql
+-- Replace <YOUR_APP_SP_UUID> with the UUID shown under
+-- "Logged in as" in the app sidebar when first deployed
+-- (e.g. xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+
+GRANT CREATE ON SCHEMA public TO "<YOUR_APP_SP_UUID>";
+GRANT USAGE ON SCHEMA public TO "<YOUR_APP_SP_UUID>";
+
+-- After the first app load creates conversation_metadata, run this too:
+GRANT SELECT, INSERT, UPDATE, DELETE ON conversation_metadata
+    TO "<YOUR_APP_SP_UUID>";
+
+-- Checkpoint table access (for delete propagation)
+GRANT SELECT, DELETE ON checkpoint_writes TO "<YOUR_APP_SP_UUID>";
+GRANT SELECT, DELETE ON checkpoint_blobs  TO "<YOUR_APP_SP_UUID>";
+GRANT SELECT, DELETE ON checkpoints       TO "<YOUR_APP_SP_UUID>";
+```
+
+The `CREATE ON SCHEMA public` grant is what allows `_ensure_table()` to create `conversation_metadata` on first run. Without it, `_init_db_once()` silently returns `False` and the sidebar shows the `⚠️ History: DB unavailable (session only)` warning.
+
+### Table Auto-Creation
+
+`@st.cache_resource` ensures the table creation runs exactly once per app deployment, not once per user session:
+
+```python
+@st.cache_resource
+def _init_db_once():
+    try:
+        _ensure_table()
+        return True
+    except Exception:
+        return False
+
+_db_ready = _init_db_once()
+```
+
+The `conversation_metadata` schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS conversation_metadata (
+    session_id   TEXT PRIMARY KEY,
+    user_email   TEXT NOT NULL,
+    title        TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    updated_at   TIMESTAMPTZ DEFAULT NOW(),
+    turn_count   INTEGER DEFAULT 0,
+    messages     TEXT              -- full JSON of [{role, content, ts}, ...]
+);
+
+CREATE INDEX IF NOT EXISTS idx_conv_user
+    ON conversation_metadata (user_email);
+```
+
+### Persistence — Save, Load, Delete
+
+Every agent response triggers an upsert via `ON CONFLICT (session_id) DO UPDATE`. If the same session ID already exists in the table, only `title`, `turn_count`, `messages`, and `updated_at` are refreshed:
+
+```python
+def db_save_conversation(conv: dict, user_email: str):
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO conversation_metadata
+                (session_id, user_email, title, turn_count, messages, updated_at)
+            VALUES (%s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (session_id) DO UPDATE SET
+                title      = EXCLUDED.title,
+                turn_count = EXCLUDED.turn_count,
+                messages   = EXCLUDED.messages,
+                updated_at = NOW()
+        """, (conv["id"], user_email, conv["title"],
+              conv["turn_count"], json.dumps(conv["messages"])))
+    conn.commit()
+```
+
+On fresh login, conversations are loaded once per session via a `db_loaded` flag in session state. This avoids a round-trip to Lakebase on every Streamlit re-render:
+
+```python
+if not st.session_state["db_loaded"]:
+    persisted = db_load_conversations(CURRENT_USER)
+    st.session_state["conversations"].update(persisted)
+    st.session_state["db_loaded"] = True
+```
+
+Delete operations — both single-conversation and delete-all — propagate to Lakebase and also clean up the corresponding LangGraph checkpoint rows using the `session_id` as `thread_id`:
+
+```python
+def db_delete_conversation(session_id: str):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM conversation_metadata WHERE session_id = %s",
+                    (session_id,))
+        for tbl in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
+            cur.execute(f"DELETE FROM public.{tbl} WHERE thread_id = %s",
+                        (session_id,))
+    conn.commit()
+```
 
 ### Calling the Agent
 
-```python
-_ROLE_MAP = {
-    "user":      ChatMessageRole.USER,
-    "assistant": ChatMessageRole.ASSISTANT,
-    "system":    ChatMessageRole.SYSTEM,
-}
+The `ts` timestamp field stored in session messages must be stripped before forwarding to the endpoint — `predict()` only accepts `role` and `content`:
 
+```python
 def call_agent(messages):
-    # Strip 'ts' timestamp field — only role + content forwarded to predict()
     sdk_msgs = [
         ChatMessage(role=_ROLE_MAP.get(m["role"], ChatMessageRole.USER),
-                    content=m["content"])
+                    content=m["content"])   # ts field intentionally excluded
         for m in messages
     ]
     resp = _w.serving_endpoints.query(name=ENDPOINT_NAME, messages=sdk_msgs)
     if resp.choices:
         return resp.choices[0].message.content
     return f"Unexpected response format: {str(resp)[:300]}"
+```
 
+### Endpoint Health Check
+
+The health check calls the SDK's `get` method and inspects the actual `ready` state — not just checking whether the endpoint name string is non-empty, which would always pass:
+
+```python
 def check_endpoint_health():
-    # Actual SDK check — not just "is the name string non-empty?"
     try:
         ep    = _w.serving_endpoints.get(name=ENDPOINT_NAME)
         state = str(ep.state.ready) if ep.state else ""
@@ -1170,68 +1324,48 @@ def check_endpoint_health():
         return False
 ```
 
-The `ts` (timestamp) field stored in session messages must be stripped before forwarding to the endpoint — `predict()` expects only `role` and `content`.
+The result is cached in session state at startup and shown as a green or red indicator in the sidebar, along with a retry button for when the endpoint is updating.
 
 ### The Pending Query Pattern
 
-```python
-# Sidebar: clicking an example sets pending_query instead of calling agent directly
-with st.sidebar:
-    for ex in EXAMPLE_QUESTIONS:
-        if st.button(ex, key=f"ex_{hash(ex)}", use_container_width=True):
-            st.session_state["pending_query"] = ex  # deferred — not executed yet
+Calling the agent from inside a sidebar button callback causes Streamlit state mutation issues mid-render. The deferred pattern sets `pending_query` in the callback and consumes it in the main script body:
 
-# Main body: pick up pending_query OR chat_input
+```python
+# Sidebar: set deferred query
+for ex in EXAMPLE_QUESTIONS:
+    if st.button(ex, key=f"ex_{hash(ex)}", use_container_width=True):
+        st.session_state["pending_query"] = ex
+
+# Main body: consume it
 user_query = (
-    st.session_state.pop("pending_query", None)          # pop clears it in one op
+    st.session_state.pop("pending_query", None)
     or st.chat_input("Type your question here...")
 )
 ```
 
-Calling the agent from inside a sidebar button callback causes Streamlit state mutation issues mid-render. The deferred pattern — set `pending_query` in the callback, consume it in the main script body — is the clean solution.
+`pop` clears the pending query in a single operation — no separate cleanup needed.
 
-### The Main Chat Loop
-
-```python
-# Render existing messages
-for msg in st.session_state["messages"]:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if "ts" in msg: st.caption(msg["ts"])
-
-# Handle new input
-if user_query:
-    ts_now = datetime.now().strftime("%H:%M")
-    st.session_state["messages"].append({"role":"user","content":user_query,"ts":ts_now})
-    with st.chat_message("user"):
-        st.markdown(user_query)
-        st.caption(ts_now)
-
-    with st.chat_message("assistant"):
-        with st.spinner("Analyzing your request..."):
-            agent_response = call_agent(st.session_state["messages"])
-        st.markdown(agent_response)
-        ts_resp = datetime.now().strftime("%H:%M")
-        st.caption(ts_resp)
-
-    st.session_state["messages"].append({"role":"assistant","content":agent_response,"ts":ts_resp})
-    st.session_state["turn_count"] += 1
-    save_current_conversation()
-    st.rerun()  # re-render with new message visible
-```
-
-### app.yaml
+### app.yaml and requirements.txt
 
 ```yaml
 command: ["sh", "-c", "streamlit run app.py --server.port $DATABRICKS_APP_PORT --server.headless true"]
 env:
   - name: AGENT_ENDPOINT_NAME
     value: "<YOUR_AGENT_ENDPOINT_NAME>"
+  - name: LAKEBASE_ENDPOINT
+    value: "<YOUR_LAKEBASE_ENDPOINT_RESOURCE_PATH>"
+  - name: LAKEBASE_HOST
+    value: "<YOUR_LAKEBASE_HOST>"
 ```
 
-`AGENT_ENDPOINT_NAME` is a deployment config value, not a code value. Redeploying the app to point at a different endpoint requires only updating `app.yaml` — `app.py` doesn't change.
+```
+streamlit>=1.35.0
+requests>=2.31.0
+databricks-sdk>=0.89.0
+psycopg2-binary>=2.9.0
+```
 
----
+`psycopg2-binary` is the only addition from the original requirements. Endpoint name, Lakebase host, and Lakebase resource path are all deployment config values in `app.yaml` — changing where the app points requires no code changes.
 
 ## Key Design Decisions and What I'd Do Differently
 
